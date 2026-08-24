@@ -96,7 +96,6 @@ func main() {
 
 	p := pool.New(cfg, dk, images, hostVol)
 	p.Start(ctx)
-	defer p.Drain(context.Background())
 
 	pipe := builder.New(cfg, st, reg, dk, hostVol)
 	pipe.Start(ctx)
@@ -143,10 +142,26 @@ func main() {
 			logger.Error(ctx, "server exit", "err", err)
 		}
 	}
+
+	// Signal all background goroutines (reaper, scheduler, builder, etc.)
+	// to stop via the root context before proceeding with cleanup.
 	cancel()
+
+	// Stop accepting new HTTP connections and drain in-flight requests.
 	shCtx, shCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shCancel()
 	_ = srv.Shutdown(shCtx)
+
+	// Remove warm sandboxes within a bounded deadline so the process exits
+	// well within the Kubernetes 30-second grace period. This must happen
+	// after ctx is cancelled so the reaper goroutine does not race with
+	// Drain. Each container removal gets its own per-call timeout (8 s)
+	// derived from this context.
+	logger.Info(context.Background(), "warm sandbox cleanup", "phase", "start")
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer drainCancel()
+	p.Drain(drainCtx)
+	logger.Info(context.Background(), "warm sandbox cleanup", "phase", "done")
 }
 
 func probe() int {

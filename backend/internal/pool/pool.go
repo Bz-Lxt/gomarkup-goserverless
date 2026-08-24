@@ -24,9 +24,17 @@ type AcquireResult struct {
 	Wakeup    time.Duration
 }
 
+// ContainerClient is the subset of the Docker client used by the pool.
+// Extracting an interface allows the pool to be unit-tested without a
+// real Docker daemon and makes the contract explicit.
+type ContainerClient interface {
+	CreateSandbox(ctx context.Context, opt dockerx.CreateSandboxOpts) (string, error)
+	RemoveContainer(ctx context.Context, id string) error
+}
+
 type Pool struct {
 	cfg     *config.Config
-	docker  *dockerx.Client
+	docker  ContainerClient
 	images  rt.Images
 	hostVol string
 
@@ -34,7 +42,7 @@ type Pool struct {
 	slots map[string]*Slot
 }
 
-func New(cfg *config.Config, d *dockerx.Client, images rt.Images, hostVol string) *Pool {
+func New(cfg *config.Config, d ContainerClient, images rt.Images, hostVol string) *Pool {
 	return &Pool{
 		cfg:     cfg,
 		docker:  d,
@@ -70,7 +78,7 @@ func (p *Pool) Acquire(ctx context.Context, runtime model.RuntimeName) (*Acquire
 			s.Touch()
 			p.mu.Unlock()
 			if err := p.waitReady(ctx, s, 800*time.Millisecond); err != nil {
-				p.discard(s)
+				p.discard(context.Background(), s)
 				return p.cold(ctx, runtime, start)
 			}
 			return &AcquireResult{Slot: s, ColdStart: false, Wakeup: time.Since(start)}, nil
@@ -86,13 +94,13 @@ func (p *Pool) Release(s *Slot) {
 	}
 	s.Touch()
 	if s.Snapshot() == SlotDead {
-		p.discard(s)
+		p.discard(context.Background(), s)
 		return
 	}
 	s.Mark(SlotWarm)
 }
 
-func (p *Pool) Discard(s *Slot) { p.discard(s) }
+func (p *Pool) Discard(s *Slot) { p.discard(context.Background(), s) }
 
 func (p *Pool) Stats() (active, idle int) {
 	p.mu.Lock()
@@ -108,11 +116,23 @@ func (p *Pool) Stats() (active, idle int) {
 	return
 }
 
+// Drain removes all slots and their containers. It must be called during
+// process shutdown. The provided context controls how long individual
+// container removals may take; use a bounded context so the process exits
+// within the Kubernetes grace period (typically 30 s).
+//
+// To avoid a self-deadlock (sync.Mutex is not reentrant), Drain snapshots
+// the slot list under the lock, releases the lock, and only then calls
+// discard for each slot — the same pattern used by reapOnce.
 func (p *Pool) Drain(ctx context.Context) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	victims := make([]*Slot, 0, len(p.slots))
 	for _, s := range p.slots {
-		p.discard(s)
+		victims = append(victims, s)
+	}
+	p.mu.Unlock()
+	for _, s := range victims {
+		p.discard(ctx, s)
 	}
 }
 
@@ -123,7 +143,7 @@ func (p *Pool) cold(ctx context.Context, runtime model.RuntimeName, start time.T
 	}
 	s.Mark(SlotBusy)
 	if err := p.waitReady(ctx, s, 3*time.Second); err != nil {
-		p.discard(s)
+		p.discard(ctx, s)
 		return nil, err
 	}
 	return &AcquireResult{Slot: s, ColdStart: true, Wakeup: time.Since(start)}, nil
@@ -172,7 +192,15 @@ func (p *Pool) create(ctx context.Context, runtime model.RuntimeName) (*Slot, er
 	return s, nil
 }
 
-func (p *Pool) discard(s *Slot) {
+// discard marks s as dead, removes it from the slots map, then removes
+// the Docker container and cleans up the socket directory.
+//
+// discard does NOT hold p.mu while talking to Docker, so it is safe to
+// call concurrently with other lock holders (Acquire, Stats, etc.).
+// The caller-supplied context bounds how long the Docker removal may
+// take; during shutdown this must be a bounded context so the process
+// exits within the Kubernetes grace period.
+func (p *Pool) discard(ctx context.Context, s *Slot) {
 	if s == nil {
 		return
 	}
@@ -180,10 +208,12 @@ func (p *Pool) discard(s *Slot) {
 	p.mu.Lock()
 	delete(p.slots, s.ID)
 	p.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	// Derive a per-container timeout from the caller's context so that
+	// a single slow/unreachable Docker daemon does not stall shutdown.
+	rmCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	if err := p.docker.RemoveContainer(ctx, s.Container); err != nil {
-		logger.Warn(ctx, "remove sandbox failed", "slot", s.ID, "err", err)
+	if err := p.docker.RemoveContainer(rmCtx, s.Container); err != nil {
+		logger.Warn(rmCtx, "remove sandbox failed", "slot", s.ID, "err", err)
 	}
 	_ = os.RemoveAll(filepath.Join(p.cfg.SocketRoot, s.ID))
 }
@@ -239,6 +269,6 @@ func (p *Pool) reapOnce() {
 	p.mu.Unlock()
 	for _, s := range victims {
 		logger.Info(context.Background(), "reap idle sandbox", "slot", s.ID, "idle", s.IdleFor().String())
-		p.discard(s)
+		p.discard(context.Background(), s)
 	}
 }
