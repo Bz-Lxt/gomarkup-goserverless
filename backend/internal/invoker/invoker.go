@@ -29,21 +29,35 @@ type Loader interface {
 	ReadyFunction(ctx context.Context, name string) (*model.Function, *model.FunctionVersion, error)
 }
 
+// PoolClient is the subset of pool.Pool used by Invoker. Extracting an
+// interface keeps Invoker testable without Docker.
+type PoolClient interface {
+	Acquire(ctx context.Context, runtime model.RuntimeName) (*pool.AcquireResult, error)
+	Release(s *pool.Slot)
+	Discard(s *pool.Slot)
+}
+
+// AgentCaller abstracts the HTTP call to the sandbox agent so Invoke can be
+// unit-tested without a real Unix socket.
+type AgentCaller func(ctx context.Context, socket string, req AgentRequest, timeout time.Duration) (*AgentResponse, error)
+
 type Invoker struct {
 	reg    *rt.Registry
-	pool   *pool.Pool
+	pool   PoolClient
 	loader Loader
 	artRel func(fn string, ver int) string
+	call   AgentCaller
 
-	mu   sync.Mutex
+	mu       sync.Mutex
 	inflight map[string]int
 }
 
-func New(reg *rt.Registry, p *pool.Pool, loader Loader) *Invoker {
+func New(reg *rt.Registry, p PoolClient, loader Loader) *Invoker {
 	return &Invoker{
 		reg:      reg,
 		pool:     p,
 		loader:   loader,
+		call:     callAgent,
 		inflight: map[string]int{},
 		artRel: func(fn string, ver int) string {
 			return filepath.ToSlash(filepath.Join("/artifacts", fn, fmt.Sprintf("v%d", ver)))
@@ -83,8 +97,10 @@ func (inv *Invoker) Invoke(ctx context.Context, name string, kind model.TriggerK
 		Env:       cloneEnv(fn.Env),
 		EventJSON: string(eventRaw),
 	}
-	agentResp, err := callAgent(ctx, acq.Slot.SocketPath, req, time.Duration(fn.TimeoutSec)*time.Second+2*time.Second)
+	agentResp, err := inv.call(ctx, acq.Slot.SocketPath, req, time.Duration(fn.TimeoutSec)*time.Second+2*time.Second)
 	if err != nil {
+		// Transport-level failure: the sandbox agent is unreachable or
+		// returned a malformed response. The slot is genuinely dead.
 		inv.pool.Discard(acq.Slot)
 		return &Result{
 			StatusCode: 502,
@@ -96,20 +112,11 @@ func (inv *Invoker) Invoke(ctx context.Context, name string, kind model.TriggerK
 			Version:    ver.Version,
 		}, nil
 	}
-	if agentResp.Error != "" {
-		acq.Slot.Mark(pool.SlotDead)
-		return &Result{
-			StatusCode: http.StatusBadGateway,
-			Body:       []byte(agentResp.Error),
-			ColdStart:  acq.ColdStart,
-			Wakeup:     acq.Wakeup,
-			Exec:       time.Duration(agentResp.DurationMS) * time.Millisecond,
-			E2E:        time.Since(start),
-			Logs:       agentResp.Logs,
-			Error:      agentResp.Error,
-			Version:    ver.Version,
-		}, nil
-	}
+	// The agent responded successfully (HTTP 200 + valid JSON). Even when the
+	// *user process* failed (e.g. os.Exit(17) → Error="exit status 17"), the
+	// sandbox container itself is still healthy and the slot should be kept
+	// warm for reuse. We surface the function-level status/error verbatim
+	// instead of conflating it with a sandbox failure.
 	res := &Result{
 		StatusCode: agentResp.Status,
 		Headers:    agentResp.Headers,
